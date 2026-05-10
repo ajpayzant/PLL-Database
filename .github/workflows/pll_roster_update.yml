@@ -1,0 +1,45 @@
+name: Update PLL Rosters
+
+on:
+  workflow_dispatch:
+    inputs:
+      spreadsheet_id:
+        description: "Google Spreadsheet ID"
+        required: true
+      triggered_by:
+        description: "Who triggered the update"
+        required: false
+      trigger_source:
+        description: "Trigger source"
+        required: false
+
+  schedule:
+    # Weekly update every Monday at 9:00 AM UTC.
+    # Adjust later if desired.
+    - cron: "0 9 * * 1"
+
+jobs:
+  update-pll-rosters:
+    runs-on: ubuntu-latest
+
+    env:
+      PLL_SPREADSHEET_ID: ${{ github.event.inputs.spreadsheet_id || secrets.PLL_SPREADSHEET_ID }}
+      GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          pip install -U pandas numpy gspread google-auth playwright openpyxl
+          python -m playwright install --with-deps chromium
+
+      - name: Update PLL rosters
+        run: |
+          python pll_roster_update.py
