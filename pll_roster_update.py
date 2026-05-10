@@ -5,6 +5,7 @@
 #   - Scrape official current PLL rosters
 #   - Update existing Google Sheet in-place
 #   - Preserve formatting and manual user selections
+#   - Update visible successful roster update timestamps
 #
 # Updates only:
 #   - Master Player Database values
@@ -12,6 +13,8 @@
 #   - Team roster tables A10:J44
 #   - Dropdown validation source ranges
 #   - Dashboard update status cells
+#   - Dashboard!B4 last successful roster update timestamp
+#   - Master Player Database!B4 last successful roster update timestamp
 #
 # Does NOT update:
 #   - Depth chart selections
@@ -30,6 +33,7 @@ import pandas as pd
 import gspread
 
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from google.oauth2.service_account import Credentials
 from gspread.utils import a1_range_to_grid_range
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
@@ -283,7 +287,11 @@ TEAM_ROSTER_COLUMNS = [
 # ============================================================
 
 def now_label():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    """
+    Returns a readable Eastern Time timestamp for roster update tracking.
+    GitHub Actions runners use UTC by default, so this forces ET.
+    """
+    return datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %I:%M:%S %p ET")
 
 
 def clean_text(value):
@@ -1109,6 +1117,37 @@ def update_dashboard_status(sh, status, detail=""):
         print(f"Warning: could not update dashboard status: {e}")
 
 
+def update_last_roster_update_cells(sh, timestamp=None):
+    """
+    Updates the visible last-successful-roster-update timestamp cells.
+
+    Updates:
+      - Dashboard!B4
+      - Master Player Database!B4
+
+    This function is called only after the roster update succeeds.
+    """
+    timestamp = timestamp or now_label()
+
+    targets = [
+        ("Dashboard", "B4"),
+        ("Master Player Database", "B4"),
+    ]
+
+    for sheet_name, cell in targets:
+        try:
+            ws = sh.worksheet(sheet_name)
+            ws.update(
+                range_name=cell,
+                values=[[timestamp]],
+                value_input_option="USER_ENTERED",
+            )
+            print(f"Updated {sheet_name}!{cell} to {timestamp}")
+
+        except Exception as e:
+            print(f"Warning: could not update {sheet_name}!{cell}: {e}")
+
+
 def update_google_sheet(pll_rosters_df, diagnostics_df):
     gc = authenticate_gspread()
     sh = gc.open_by_key(SPREADSHEET_ID)
@@ -1154,12 +1193,23 @@ def update_google_sheet(pll_rosters_df, diagnostics_df):
     # Reapply validations only. This does not change user selections.
     reapply_all_dropdown_validations(sh, list_ranges, len(sheet_df))
 
-    # Optional: write a small diagnostics snapshot to Dashboard only.
+    # Build success summary.
     total_players = len(sheet_df)
     teams = sheet_df["Team Code"].nunique()
+    successful_update_time = now_label()
 
-    detail = f"Updated {total_players} players across {teams} teams."
+    detail = (
+        f"Updated {total_players} players across {teams} teams. "
+        f"Last successful roster update: {successful_update_time}"
+    )
 
+    # Update visible last-successful-update timestamp cells.
+    # These are the two cells requested:
+    #   - Dashboard!B4
+    #   - Master Player Database!B4
+    update_last_roster_update_cells(sh, successful_update_time)
+
+    # Update Dashboard status area.
     update_dashboard_status(sh, "Success", detail)
 
     print(detail)
