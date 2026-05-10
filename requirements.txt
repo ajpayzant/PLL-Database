@@ -1,0 +1,6 @@
+pandas
+numpy
+gspread
+google-auth
+playwright
+openpyxl
