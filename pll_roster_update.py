@@ -15,6 +15,7 @@
 #   - Dashboard update status cells
 #   - Dashboard!B4 last successful roster update timestamp
 #   - Master Player Database!B4 last successful roster update timestamp
+#   - Master Player Database formulas for Tier / Lineup Status / Injury Status
 #
 # Does NOT update:
 #   - Depth chart selections
@@ -213,10 +214,9 @@ MASTER_TIERS = [
     "Elite",
     "Starter",
     "Rotation",
+    "Backup",
     "Depth",
-    "Prospect",
-    "Free Agent",
-    "Watchlist",
+    "Rookie / Unknown",
     "Scrub",
 ]
 
@@ -359,6 +359,12 @@ def grid_range(ws, a1_range):
 
 
 def safe_batch_update(sh, requests, chunk_size=80):
+    """
+    Safely sends Google Sheets batchUpdate requests in chunks.
+
+    If a batch fails, this prints the chunk index and sample requests so future
+    layout/range errors are easy to diagnose from GitHub Actions logs.
+    """
     requests = [r for r in requests if r]
 
     if not requests:
@@ -366,8 +372,46 @@ def safe_batch_update(sh, requests, chunk_size=80):
 
     for i in range(0, len(requests), chunk_size):
         chunk = requests[i:i + chunk_size]
-        sh.batch_update({"requests": chunk})
-        time.sleep(0.25)
+
+        try:
+            sh.batch_update({"requests": chunk})
+            time.sleep(0.25)
+
+        except Exception as e:
+            print("=" * 100)
+            print("BATCH UPDATE FAILED")
+            print(f"Chunk start index: {i}")
+            print(f"Chunk size: {len(chunk)}")
+            print("First few requests in failed chunk:")
+
+            for j, req in enumerate(chunk[:8]):
+                print(f"Request {i + j}: {req}")
+
+            print("=" * 100)
+            raise e
+
+
+def ensure_worksheet_grid_size(ws, min_rows=None, min_cols=None):
+    """
+    Ensures a worksheet has enough physical rows/columns before applying
+    validations or writing ranges.
+
+    This prevents grid-limit errors like:
+      Range ('Attack Tiers'!Z6:Z35) exceeds grid limits.
+    """
+    current_rows = ws.row_count
+    current_cols = ws.col_count
+
+    target_rows = max(current_rows, min_rows or current_rows)
+    target_cols = max(current_cols, min_cols or current_cols)
+
+    if target_rows != current_rows or target_cols != current_cols:
+        print(
+            f"Resizing {ws.title}: "
+            f"{current_rows}x{current_cols} -> {target_rows}x{target_cols}"
+        )
+        ws.resize(rows=target_rows, cols=target_cols)
+        time.sleep(0.5)
 
 
 def write_values(ws, start_cell, values, value_input_option="USER_ENTERED"):
@@ -996,32 +1040,85 @@ def build_depth_chart_rows():
 
 
 def reapply_all_dropdown_validations(sh, list_ranges, sheet_row_count):
+    """
+    Reapplies dropdown validations after the roster/list refresh.
+
+    Updated for the current workbook layout:
+      - Standard tier tabs use 3-column tier blocks:
+          Rank | Player | Notes
+        Player columns: B, E, H, K, N, Q, T
+
+      - Specialists Tiers uses 3-column tier blocks:
+          Rank | Player | Notes
+        Player columns: B, E, H, K, N, Q
+
+    This avoids the old invalid Z-column validation error created by the
+    previous 4-column tier layout assumption.
+    """
     requests = []
 
-    # Master DB editable dropdowns
+    # ------------------------------------------------------------
+    # Master DB dropdowns
+    # ------------------------------------------------------------
     master_ws = sh.worksheet("Master Player Database")
+
+    ensure_worksheet_grid_size(
+        master_ws,
+        min_rows=max(MASTER_DATA_START_ROW + sheet_row_count + 10, 1000),
+        min_cols=23,
+    )
+
     master_end = max(MASTER_DATA_START_ROW + sheet_row_count - 1, MASTER_DATA_START_ROW)
 
     requests += [
-        validation_one_of_list(master_ws, f"T{MASTER_DATA_START_ROW}:T{master_end}", MASTER_TIERS, strict=False),
-        validation_one_of_list(master_ws, f"U{MASTER_DATA_START_ROW}:U{master_end}", LINEUP_STATUSES, strict=False),
-        validation_one_of_list(master_ws, f"V{MASTER_DATA_START_ROW}:V{master_end}", INJURY_STATUSES, strict=False),
+        validation_one_of_list(
+            master_ws,
+            f"T{MASTER_DATA_START_ROW}:T{master_end}",
+            MASTER_TIERS,
+            strict=False,
+        ),
+        validation_one_of_list(
+            master_ws,
+            f"U{MASTER_DATA_START_ROW}:U{master_end}",
+            LINEUP_STATUSES,
+            strict=False,
+        ),
+        validation_one_of_list(
+            master_ws,
+            f"V{MASTER_DATA_START_ROW}:V{master_end}",
+            INJURY_STATUSES,
+            strict=False,
+        ),
     ]
 
+    # ------------------------------------------------------------
     # Team tabs
+    # ------------------------------------------------------------
     depth_rows = build_depth_chart_rows()
 
     for team in PLL_TEAMS:
         code = team["Team_Code"]
         ws = sh.worksheet(team["Tab"])
 
+        # Team tabs currently use through Q and down to about row 76.
+        # Keep a buffer so validations do not fail after minor layout changes.
+        ensure_worksheet_grid_size(ws, min_rows=95, min_cols=17)
+
         requests.append(
             validation_one_of_list(ws, "I10:I44", LINEUP_STATUSES, strict=False)
         )
 
-        requests.append(
-            validation_one_of_range(ws, "L10:L29", list_ranges[f"{code}_ALL"], strict=False)
-        )
+        if f"{code}_ALL" in list_ranges:
+            requests.append(
+                validation_one_of_range(
+                    ws,
+                    "L10:L29",
+                    list_ranges[f"{code}_ALL"],
+                    strict=False,
+                )
+            )
+        else:
+            print(f"Warning: missing list range {code}_ALL; skipping injury player dropdown.")
 
         requests.append(
             validation_one_of_list(ws, "M10:M29", INJURY_STATUSES, strict=False)
@@ -1030,41 +1127,105 @@ def reapply_all_dropdown_validations(sh, list_ranges, sheet_row_count):
         # Depth chart dropdowns
         for row_idx, depth_row in enumerate(depth_rows, start=50):
             pos = depth_row[1]
-            requests.append(
-                validation_one_of_range(ws, f"D{row_idx}:D{row_idx}", list_ranges[f"{code}_{pos}"], strict=False)
-            )
+            range_key = f"{code}_{pos}"
+
+            if range_key in list_ranges:
+                requests.append(
+                    validation_one_of_range(
+                        ws,
+                        f"D{row_idx}:D{row_idx}",
+                        list_ranges[range_key],
+                        strict=False,
+                    )
+                )
+            else:
+                print(f"Warning: missing list range {range_key}; skipping depth row {row_idx}.")
 
         # Projected lineup dropdowns
         for spec in projected_card_specs():
             pos = spec["pos"]
-            requests.append(
-                validation_one_of_range(ws, spec["player_range"], list_ranges[f"{code}_{pos}"], strict=False)
-            )
+            range_key = f"{code}_{pos}"
 
-    # Tier tabs
+            if range_key in list_ranges:
+                requests.append(
+                    validation_one_of_range(
+                        ws,
+                        spec["player_range"],
+                        list_ranges[range_key],
+                        strict=False,
+                    )
+                )
+            else:
+                print(f"Warning: missing list range {range_key}; skipping projected card {spec['slot']}.")
+
+    # ------------------------------------------------------------
+    # Standard tier tabs
+    # ------------------------------------------------------------
+    # CURRENT MANUAL LAYOUT:
+    #   7 tier blocks, each 3 columns wide:
+    #     Rank | Player | Notes
+    #
+    # Player columns:
+    #   B, E, H, K, N, Q, T
+    #
+    # Body rows:
+    #   6:35
+    # ------------------------------------------------------------
+    standard_tier_player_cols = ["B", "E", "H", "K", "N", "Q", "T"]
+
     tier_tabs = {
-        "Attack Tiers": ("ALL_A", 7),
-        "Midfield Tiers": ("ALL_M", 7),
-        "Defense Tiers": ("ALL_D", 7),
-        "Goalie Tiers": ("ALL_G", 7),
+        "Attack Tiers": "ALL_A",
+        "Midfield Tiers": "ALL_M",
+        "Defense Tiers": "ALL_D",
+        "Goalie Tiers": "ALL_G",
     }
 
-    for tab_name, (list_key, tier_count) in tier_tabs.items():
+    for tab_name, list_key in tier_tabs.items():
         try:
             ws = sh.worksheet(tab_name)
         except gspread.WorksheetNotFound:
+            print(f"Warning: tier tab not found, skipping validations: {tab_name}")
             continue
 
-        for tier_idx in range(tier_count):
-            player_col = 2 + tier_idx * 4
-            player_col_letter = col_to_letter(player_col)
+        # Current standard tier tabs end at U, which is 21 columns.
+        ensure_worksheet_grid_size(ws, min_rows=70, min_cols=21)
+
+        if list_key not in list_ranges:
+            print(f"Warning: missing list range {list_key}, skipping {tab_name}")
+            continue
+
+        for player_col_letter in standard_tier_player_cols:
             requests.append(
-                validation_one_of_range(ws, f"{player_col_letter}6:{player_col_letter}35", list_ranges[list_key], strict=False)
+                validation_one_of_range(
+                    ws,
+                    f"{player_col_letter}6:{player_col_letter}35",
+                    list_ranges[list_key],
+                    strict=False,
+                )
             )
 
+    # ------------------------------------------------------------
     # Specialists Tiers
+    # ------------------------------------------------------------
+    # CURRENT MANUAL LAYOUT:
+    #   6 tier blocks, each 3 columns wide:
+    #     Rank | Player | Notes
+    #
+    # Player columns:
+    #   B, E, H, K, N, Q
+    #
+    # Section body ranges:
+    #   LSM:  7:26
+    #   SSDM: 37:56
+    #   FO:   67:86
+    # ------------------------------------------------------------
+    specialist_player_cols = ["B", "E", "H", "K", "N", "Q"]
+
     try:
         ws = sh.worksheet("Specialists Tiers")
+
+        # Current Specialists tab ends at R, which is 18 columns.
+        ensure_worksheet_grid_size(ws, min_rows=95, min_cols=18)
 
         specialist_sections = [
             ("ALL_LSM", 7, 26),
@@ -1073,17 +1234,29 @@ def reapply_all_dropdown_validations(sh, list_ranges, sheet_row_count):
         ]
 
         for list_key, start_row, end_row in specialist_sections:
-            for tier_idx in range(6):
-                player_col = 2 + tier_idx * 4
-                player_col_letter = col_to_letter(player_col)
+            if list_key not in list_ranges:
+                print(f"Warning: missing list range {list_key}, skipping specialist section.")
+                continue
+
+            for player_col_letter in specialist_player_cols:
                 requests.append(
-                    validation_one_of_range(ws, f"{player_col_letter}{start_row}:{player_col_letter}{end_row}", list_ranges[list_key], strict=False)
+                    validation_one_of_range(
+                        ws,
+                        f"{player_col_letter}{start_row}:{player_col_letter}{end_row}",
+                        list_ranges[list_key],
+                        strict=False,
+                    )
                 )
 
     except gspread.WorksheetNotFound:
-        pass
+        print("Warning: Specialists Tiers tab not found, skipping validations.")
 
+    # ------------------------------------------------------------
+    # Apply validation requests
+    # ------------------------------------------------------------
+    print(f"Applying {len(requests)} dropdown validation requests...")
     safe_batch_update(sh, requests)
+    print("Dropdown validations reapplied successfully.")
 
 
 # ============================================================
@@ -1148,6 +1321,228 @@ def update_last_roster_update_cells(sh, timestamp=None):
             print(f"Warning: could not update {sheet_name}!{cell}: {e}")
 
 
+def q_sheet(sheet_name):
+    """
+    Safely quotes a Google Sheet tab name for formulas.
+    Google Sheets escapes single quotes in tab names by doubling them.
+    """
+    safe_name = str(sheet_name).replace("'", "''")
+    return f"'{safe_name}'"
+
+
+def build_master_lineup_status_formula(row_num):
+    """
+    Builds a formula for Master Player Database column U.
+
+    Source of truth:
+      Team tab roster table Lineup Status column I.
+    """
+    switch_parts = []
+
+    for code, tab_name in [(team["Team_Code"], team["Tab"]) for team in PLL_TEAMS]:
+        sheet_ref = q_sheet(tab_name)
+        lookup = (
+            f'IFNA('
+            f'IF('
+            f'XLOOKUP($A{row_num},{sheet_ref}!$A$10:$A$44,{sheet_ref}!$I$10:$I$44)="",'
+            f'"Active",'
+            f'XLOOKUP($A{row_num},{sheet_ref}!$A$10:$A$44,{sheet_ref}!$I$10:$I$44)'
+            f'),'
+            f'""'
+            f')'
+        )
+        switch_parts.append(f'"{code}",{lookup}')
+
+    switch_body = ",".join(switch_parts)
+
+    return (
+        f'=IF($A{row_num}="","",'
+        f'IFERROR(SWITCH($E{row_num},{switch_body}),""))'
+    )
+
+
+def build_master_injury_status_formula(row_num):
+    """
+    Builds a formula for Master Player Database column V.
+
+    Source of truth:
+      Team tab injury tracker Player/Status columns L:M.
+
+    If a player is not listed in their team injury tracker, returns Healthy.
+    """
+    switch_parts = []
+
+    for code, tab_name in [(team["Team_Code"], team["Tab"]) for team in PLL_TEAMS]:
+        sheet_ref = q_sheet(tab_name)
+        lookup = (
+            f'IFNA('
+            f'IF('
+            f'XLOOKUP($A{row_num},{sheet_ref}!$L$10:$L$29,{sheet_ref}!$M$10:$M$29)="",'
+            f'"Healthy",'
+            f'XLOOKUP($A{row_num},{sheet_ref}!$L$10:$L$29,{sheet_ref}!$M$10:$M$29)'
+            f'),'
+            f'"Healthy"'
+            f')'
+        )
+        switch_parts.append(f'"{code}",{lookup}')
+
+    switch_body = ",".join(switch_parts)
+
+    return (
+        f'=IF($A{row_num}="","",'
+        f'IFERROR(SWITCH($E{row_num},{switch_body}),"Healthy"))'
+    )
+
+
+def tier_condition(tab_name, player_col, start_row, end_row, row_num, master_tier_value):
+    """
+    Builds one IFS condition for the Master Tier formula.
+
+    Tier tabs use dropdown values formatted as:
+      Player Name (TEAM)
+    """
+    sheet_ref = q_sheet(tab_name)
+    player_key = f'$A{row_num}&" ("&$E{row_num}&")"'
+
+    return (
+        f'COUNTIF({sheet_ref}!${player_col}${start_row}:${player_col}${end_row},{player_key})>0,'
+        f'"{master_tier_value}"'
+    )
+
+
+def build_master_tier_formula(row_num):
+    """
+    Builds a formula for Master Player Database column T.
+
+    Source of truth:
+      Current revised tier board layout.
+
+    Standard tier tabs:
+      Attack/Midfield/Defense/Goalie use 3-column blocks.
+      Player columns: B, E, H, K, N, Q, T
+      Player rows: 6:35
+
+    Specialists tab:
+      Player columns: B, E, H, K, N, Q
+      LSM rows: 7:26
+      SSDM rows: 37:56
+      FO rows: 67:86
+    """
+    conditions = []
+
+    standard_player_cols = ["B", "E", "H", "K", "N", "Q", "T"]
+    standard_tier_values = [
+        "Franchise",
+        "Elite",
+        "Starter",
+        "Rotation",
+        "Depth",
+        "Rookie / Unknown",
+        "Scrub",
+    ]
+
+    for tab_name in ["Attack Tiers", "Midfield Tiers", "Defense Tiers"]:
+        for player_col, tier_value in zip(standard_player_cols, standard_tier_values):
+            conditions.append(
+                tier_condition(tab_name, player_col, 6, 35, row_num, tier_value)
+            )
+
+    goalie_tier_values = [
+        "Franchise",
+        "Elite",
+        "Starter",
+        "Backup",
+        "Depth",
+        "Rookie / Unknown",
+        "Scrub",
+    ]
+
+    for player_col, tier_value in zip(standard_player_cols, goalie_tier_values):
+        conditions.append(
+            tier_condition("Goalie Tiers", player_col, 6, 35, row_num, tier_value)
+        )
+
+    specialist_player_cols = ["B", "E", "H", "K", "N", "Q"]
+    specialist_tier_values = [
+        "Elite",
+        "Starter",
+        "Rotation",
+        "Depth",
+        "Rookie / Unknown",
+        "Scrub",
+    ]
+
+    specialist_sections = [
+        ("LSM", 7, 26),
+        ("SSDM", 37, 56),
+        ("FO", 67, 86),
+    ]
+
+    for _section_name, start_row, end_row in specialist_sections:
+        for player_col, tier_value in zip(specialist_player_cols, specialist_tier_values):
+            conditions.append(
+                tier_condition("Specialists Tiers", player_col, start_row, end_row, row_num, tier_value)
+            )
+
+    conditions_body = ",".join(conditions)
+
+    return (
+        f'=IF($A{row_num}="","",'
+        f'IFERROR(IFS({conditions_body}),""))'
+    )
+
+
+def write_master_status_sync_formulas(master_ws, row_count):
+    """
+    Rewrites one-way sync formulas into Master Player Database after the roster
+    refresh overwrites master data rows.
+
+    Master columns:
+      T = Tier, pulled from tier tabs
+      U = Lineup Status, pulled from team roster tables
+      V = Injury Status, pulled from team injury trackers
+    """
+    if row_count <= 0:
+        print("No master rows found; skipping status sync formulas.")
+        return
+
+    start_row = MASTER_DATA_START_ROW
+    end_row = MASTER_DATA_START_ROW + row_count - 1
+
+    tier_formulas = []
+    lineup_status_formulas = []
+    injury_status_formulas = []
+
+    for row_num in range(start_row, end_row + 1):
+        tier_formulas.append([build_master_tier_formula(row_num)])
+        lineup_status_formulas.append([build_master_lineup_status_formula(row_num)])
+        injury_status_formulas.append([build_master_injury_status_formula(row_num)])
+
+    print(f"Writing master one-way sync formulas to rows {start_row}:{end_row}...")
+
+    master_ws.update(
+        range_name=f"T{start_row}:T{end_row}",
+        values=tier_formulas,
+        value_input_option="USER_ENTERED",
+    )
+    time.sleep(0.25)
+
+    master_ws.update(
+        range_name=f"U{start_row}:U{end_row}",
+        values=lineup_status_formulas,
+        value_input_option="USER_ENTERED",
+    )
+    time.sleep(0.25)
+
+    master_ws.update(
+        range_name=f"V{start_row}:V{end_row}",
+        values=injury_status_formulas,
+        value_input_option="USER_ENTERED",
+    )
+
+    print("Master one-way sync formulas written successfully.")
+
+
 def update_google_sheet(pll_rosters_df, diagnostics_df):
     gc = authenticate_gspread()
     sh = gc.open_by_key(SPREADSHEET_ID)
@@ -1192,6 +1587,10 @@ def update_google_sheet(pll_rosters_df, diagnostics_df):
 
     # Reapply validations only. This does not change user selections.
     reapply_all_dropdown_validations(sh, list_ranges, len(sheet_df))
+
+    # Reapply one-way sync formulas into Master status columns after the
+    # roster refresh rewrites the Master Player Database data rows.
+    write_master_status_sync_formulas(master_ws, len(sheet_df))
 
     # Build success summary.
     total_players = len(sheet_df)
