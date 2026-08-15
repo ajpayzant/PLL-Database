@@ -29,15 +29,15 @@ import os
 import re
 import json
 import time
-import asyncio
+import urllib.error
+import urllib.request
 import pandas as pd
 import gspread
 
-from datetime import datetime
+from datetime import datetime, date
 from zoneinfo import ZoneInfo
 from google.oauth2.service_account import Credentials
 from gspread.utils import a1_range_to_grid_range
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
 
 # ============================================================
@@ -60,11 +60,49 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
-HEADLESS = True
-PAGE_TIMEOUT_MS = 60000
-CARD_WAIT_TIMEOUT_MS = 30000
-SCROLL_PASSES = 8
-SCROLL_PAUSE_MS = 600
+# ------------------------------------------------------------
+# PLL stats API
+# ------------------------------------------------------------
+# Replaces the old Playwright DOM scrape. The site was rebuilt on Next.js
+# App Router, which removed every Emotion "css-*" class the extractor keyed
+# on (div.css-fps5zs matched 0 elements), so the scrape silently returned
+# zero players for all 8 teams. The roster pages now server-render this same
+# API, so we call it directly instead of parsing HTML.
+
+PLL_API_BASE = "https://api.stats.premierlacrosseleague.com/api/v4"
+
+PLL_BEARER_TOKEN = os.environ.get("PLL_BEARER_TOKEN", "").replace("^", "").strip()
+
+if not PLL_BEARER_TOKEN:
+    raise RuntimeError(
+        "Missing PLL_BEARER_TOKEN environment variable. "
+        "Add it as a GitHub Actions repository secret."
+    )
+
+if not PLL_BEARER_TOKEN.lower().startswith("bearer "):
+    PLL_BEARER_TOKEN = f"Bearer {PLL_BEARER_TOKEN}"
+
+PLL_SEASON = int(os.environ.get("PLL_SEASON", "").strip() or datetime.now(ZoneInfo("America/New_York")).year)
+PLL_SEASON_SEGMENT = os.environ.get("PLL_SEASON_SEGMENT", "regular").strip() or "regular"
+
+# The API rejects requests missing authorization/authsource with
+# 400 "Missing authorization in header" or 401 "Unauthorized".
+PLL_API_HEADERS = {
+    "accept": "application/json",
+    "accept-language": "en-US,en;q=0.9",
+    "authorization": PLL_BEARER_TOKEN,
+    "authsource": "web",
+    "origin": "https://premierlacrosseleague.com",
+    "referer": "https://premierlacrosseleague.com/",
+    "time-zone": "America/New_York",
+    "user-agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
+    ),
+}
+
+API_REQUEST_TIMEOUT = 30
+API_REQUEST_RETRIES = 3
 
 FIXED_ROSTER_ROWS = 35
 FIXED_INJURY_ROWS = 20
@@ -83,6 +121,7 @@ MASTER_CLEAR_END_ROW = 1000
 PLL_TEAMS = [
     {
         "Team_Code": "BOS",
+        "API_ID": "CAN",
         "Team": "Boston Cannons",
         "Tab": "BOS Cannons",
         "Division": "Eastern",
@@ -93,6 +132,7 @@ PLL_TEAMS = [
     },
     {
         "Team_Code": "CAL",
+        "API_ID": "RED",
         "Team": "California Redwoods",
         "Tab": "CAL Redwoods",
         "Division": "Western",
@@ -104,6 +144,7 @@ PLL_TEAMS = [
     },
     {
         "Team_Code": "CAR",
+        "API_ID": "CHA",
         "Team": "Carolina Chaos",
         "Tab": "CAR Chaos",
         "Division": "Western",
@@ -114,6 +155,7 @@ PLL_TEAMS = [
     },
     {
         "Team_Code": "DEN",
+        "API_ID": "OUT",
         "Team": "Denver Outlaws",
         "Tab": "DEN Outlaws",
         "Division": "Western",
@@ -124,6 +166,7 @@ PLL_TEAMS = [
     },
     {
         "Team_Code": "MD",
+        "API_ID": "WHP",
         "Team": "Maryland Whipsnakes",
         "Tab": "MD Whipsnakes",
         "Division": "Eastern",
@@ -134,6 +177,7 @@ PLL_TEAMS = [
     },
     {
         "Team_Code": "NY",
+        "API_ID": "ATL",
         "Team": "New York Atlas",
         "Tab": "NY Atlas",
         "Division": "Eastern",
@@ -144,6 +188,7 @@ PLL_TEAMS = [
     },
     {
         "Team_Code": "PHI",
+        "API_ID": "WAT",
         "Team": "Philadelphia Waterdogs",
         "Tab": "PHI Waterdogs",
         "Division": "Eastern",
@@ -154,6 +199,7 @@ PLL_TEAMS = [
     },
     {
         "Team_Code": "UTA",
+        "API_ID": "ARC",
         "Team": "Utah Archers",
         "Tab": "UTA Archers",
         "Division": "Western",
@@ -316,6 +362,28 @@ def player_key_from_row(row):
     return f"name::{normalize_key(player)}"
 
 
+def player_keys_from_row(row):
+    """
+    All keys a row can be matched on, slug first.
+
+    The old scrape read Image_Slug from an <img alt>; we now derive it from
+    the API's profileUrl. If those ever disagree, matching on slug alone
+    would silently orphan every manual Tier / Lineup Status / Injury Status /
+    Manual Notes value. Falling back to the name key prevents that.
+    """
+    keys = []
+
+    image_slug = clean_text(row.get("Image Slug", row.get("Image_Slug", "")))
+    if image_slug:
+        keys.append(f"slug::{normalize_key(image_slug)}")
+
+    player = clean_text(row.get("Player", ""))
+    if player:
+        keys.append(f"name::{normalize_key(player)}")
+
+    return keys
+
+
 def normalize_position(pos):
     pos = clean_text(pos).upper()
 
@@ -458,230 +526,169 @@ def validation_one_of_range(ws, a1_range, range_formula, strict=False):
 
 
 # ============================================================
-# SCRAPER
+# PLL API COLLECTION
 # ============================================================
 
-ROSTER_EXTRACTOR_JS = """
-(teamInfo) => {
-  function cleanText(x) {
-    return (x || "").replace(/\\s+/g, " ").trim();
-  }
-
-  function normalizePosition(pos) {
-    pos = cleanText(pos).toUpperCase();
-
-    const aliases = {
-      "ATTACK": "A",
-      "MIDFIELD": "M",
-      "DEFENSE": "D",
-      "FACEOFF": "FO",
-      "FACE-OFF": "FO",
-      "GOALIE": "G",
-      "GOALTENDER": "G",
-      "LONG STICK MIDFIELD": "LSM",
-      "SHORT STICK DEFENSIVE MIDFIELD": "SSDM"
-    };
-
-    return aliases[pos] || pos || "UNK";
-  }
-
-  function extractDetails(card) {
-    const details = {};
-
-    card.querySelectorAll("div").forEach(div => {
-      const spans = Array.from(div.children || []).filter(el => el.tagName === "SPAN");
-
-      if (spans.length >= 2) {
-        const label = cleanText(spans[0].innerText);
-        const value = cleanText(spans[1].innerText);
-
-        if (label && value) {
-          details[label] = value;
-        }
-      }
-    });
-
-    return details;
-  }
-
-  const cards = Array.from(document.querySelectorAll("div.css-fps5zs"));
-  const rows = [];
-
-  cards.forEach(card => {
-    const firstName = cleanText(card.querySelector("p.firstName")?.innerText);
-    const lastName = cleanText(card.querySelector("p.lastName")?.innerText);
-    const player = cleanText(`${firstName} ${lastName}`);
-
-    const jersey = cleanText(card.querySelector(".points")?.innerText);
-
-    const playerImg = card.querySelector(".playerImg img");
-    const imageSlug = cleanText(playerImg?.getAttribute("alt"));
-    const imageURL = cleanText(playerImg?.getAttribute("src"));
-
-    let country = "";
-
-    card.querySelectorAll("img").forEach(img => {
-      const alt = cleanText(img.getAttribute("alt"));
-
-      if (alt.toLowerCase().startsWith("country")) {
-        country = cleanText(alt.replace(/^Country:\\s*/i, ""));
-      }
-    });
-
-    const details = extractDetails(card);
-
-    const row = {
-      Player: player,
-      First_Name: firstName,
-      Last_Name: lastName,
-      Team: teamInfo.Team,
-      Team_Code: teamInfo.Team_Code,
-      Division: teamInfo.Division,
-      Position: normalizePosition(details["Position"]),
-      Jersey: jersey,
-      Handedness: cleanText(details["Hand"]),
-      Height: cleanText(details["Height"]),
-      Age: cleanText(details["Age"]),
-      College: cleanText(details["College"]),
-      Country: country,
-      Image_Slug: imageSlug,
-      Image_URL: imageURL,
-      Page_URL: window.location.href,
-      Page_Title: document.title,
-      Extracted_At: new Date().toISOString()
-    };
-
-    if (row.Player && row.Position && row.Position !== "UNK") {
-      rows.push(row);
-    }
-  });
-
-  return {
-    raw_card_count: cards.length,
-    raw_valid_rows: rows.length,
-    rows: rows
-  };
-}
-"""
+def now_iso():
+    return datetime.now(ZoneInfo("America/New_York")).isoformat(timespec="seconds")
 
 
-def dedupe_team_rows(rows):
-    best = {}
+def players_url():
+    return f"{PLL_API_BASE}/players?year={PLL_SEASON}"
 
-    for row in rows:
-        player = clean_text(row.get("Player"))
-        image_slug = clean_text(row.get("Image_Slug"))
-        key = f"{player}|{image_slug}"
 
-        if not player:
-            continue
+def standings_url():
+    return f"{PLL_API_BASE}/standings?year={PLL_SEASON}&seasonSegment={PLL_SEASON_SEGMENT}"
 
-        score = sum(1 for v in row.values() if clean_text(v))
 
-        if key not in best:
-            best[key] = (score, row)
+def api_get(url):
+    """
+    GET a PLL API endpoint and return (data.items, http_status).
+
+    Retries transient failures. A 401/403 is raised immediately since
+    retrying a rejected token is pointless.
+    """
+    last_error = None
+
+    for attempt in range(1, API_REQUEST_RETRIES + 1):
+        request = urllib.request.Request(url, headers=PLL_API_HEADERS, method="GET")
+
+        try:
+            with urllib.request.urlopen(request, timeout=API_REQUEST_TIMEOUT) as response:
+                status = response.status
+                body = response.read().decode("utf-8")
+
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")
+
+            if e.code in (401, 403):
+                raise RuntimeError(
+                    f"PLL API rejected the token (HTTP {e.code}) for {url}. "
+                    f"Update the PLL_BEARER_TOKEN secret. Response: {body[:300]}"
+                ) from e
+
+            last_error = f"HTTP {e.code}: {body[:300]}"
+
+        except (urllib.error.URLError, TimeoutError) as e:
+            last_error = str(e)
+
         else:
-            old_score, _ = best[key]
-            if score > old_score:
-                best[key] = (score, row)
+            try:
+                payload = json.loads(body)
+            except json.JSONDecodeError as e:
+                raise RuntimeError(
+                    f"PLL API returned non-JSON for {url}. Response: {body[:300]}"
+                ) from e
 
-    return [x[1] for x in best.values()]
+            items = ((payload or {}).get("data") or {}).get("items")
 
+            if not isinstance(items, list):
+                raise RuntimeError(
+                    f"Unexpected PLL API response shape for {url}. "
+                    f"Expected data.items list. Response: {body[:300]}"
+                )
 
-async def launch_browser(playwright):
-    args = [
-        "--no-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-gpu",
-        "--disable-setuid-sandbox",
-        "--disable-software-rasterizer",
-    ]
+            return items, status
 
-    return await playwright.chromium.launch(
-        headless=HEADLESS,
-        args=args,
+        print(f"  API attempt {attempt}/{API_REQUEST_RETRIES} failed: {last_error}")
+
+        if attempt < API_REQUEST_RETRIES:
+            time.sleep(2 ** attempt)
+
+    raise RuntimeError(
+        f"PLL API request failed after {API_REQUEST_RETRIES} attempts for {url}. "
+        f"Last error: {last_error}"
     )
 
 
-async def scrape_team_roster(page, team):
-    print(f"\nSCRAPING {team['Team_Code']} — {team['Team']}")
+def fetch_pll_players():
+    url = players_url()
+    print(f"Fetching players: {url}")
+    items, status = api_get(url)
+    print(f"  {len(items)} players returned (HTTP {status})")
+    return items, status
 
-    diagnostics = []
-    best_rows = []
 
-    for url in team["URLs"]:
-        print(f"Trying URL: {url}")
+def fetch_pll_standings():
+    url = standings_url()
+    print(f"Fetching teams: {url}")
+    items, status = api_get(url)
+    print(f"  {len(items)} teams returned (HTTP {status})")
+    return items, status
 
-        try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
 
-            try:
-                await page.wait_for_selector("p.firstName", timeout=CARD_WAIT_TIMEOUT_MS)
-            except PlaywrightTimeoutError:
-                print("  Warning: p.firstName selector did not appear before timeout.")
+def slug_from_profile_url(profile_url):
+    """
+    'https://img.premierlacrosseleague.com/Players/2026/ck-giancola.webp?v=2'
+    -> 'ck-giancola'
 
-            for _ in range(SCROLL_PASSES):
-                await page.mouse.wheel(0, 2500)
-                await page.wait_for_timeout(SCROLL_PAUSE_MS)
+    The old scrape read this slug from an <img alt>. player_key_from_row()
+    keys on it to carry manual Tier / Lineup Status / Notes across runs,
+    so the format has to stay stable.
+    """
+    url = clean_text(profile_url)
 
-            await page.mouse.wheel(0, -10000)
-            await page.wait_for_timeout(1000)
+    if not url:
+        return ""
 
-            result = await page.evaluate(
-                ROSTER_EXTRACTOR_JS,
-                {
-                    "Team": team["Team"],
-                    "Team_Code": team["Team_Code"],
-                    "Division": team["Division"],
-                },
-            )
+    tail = url.split("?")[0].rstrip("/").split("/")[-1]
 
-            raw_card_count = result.get("raw_card_count", 0)
-            raw_valid_rows = result.get("raw_valid_rows", 0)
-            rows = result.get("rows", [])
-            deduped_rows = dedupe_team_rows(rows)
+    return re.sub(r"\.(webp|png|jpe?g|gif)$", "", tail, flags=re.IGNORECASE)
 
-            print(f"  Raw card containers: {raw_card_count}")
-            print(f"  Raw valid rows: {raw_valid_rows}")
-            print(f"  Deduped players: {len(deduped_rows)}")
 
-            diagnostics.append({
-                "Team_Code": team["Team_Code"],
-                "Team": team["Team"],
-                "URL_Tried": url,
-                "Final_URL": page.url,
-                "Raw_Card_Containers": raw_card_count,
-                "Raw_Valid_Rows": raw_valid_rows,
-                "Deduped_Players": len(deduped_rows),
-                "Status": "OK" if len(deduped_rows) else "NO_PLAYERS",
-                "Error": "",
-            })
+def age_from_dob(dob, today=None):
+    """The API returns dob; the old scrape returned a rendered age."""
+    match = re.match(r"^(\d{4})-(\d{2})-(\d{2})", clean_text(dob))
 
-            if len(deduped_rows) > len(best_rows):
-                best_rows = deduped_rows
+    if not match:
+        return ""
 
-            if len(deduped_rows) >= 15:
-                break
+    born = date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+    today = today or datetime.now(ZoneInfo("America/New_York")).date()
 
-        except Exception as e:
-            print(f"  ERROR: {e}")
+    age = today.year - born.year - ((today.month, today.day) < (born.month, born.day))
 
-            diagnostics.append({
-                "Team_Code": team["Team_Code"],
-                "Team": team["Team"],
-                "URL_Tried": url,
-                "Final_URL": "",
-                "Raw_Card_Containers": 0,
-                "Raw_Valid_Rows": 0,
-                "Deduped_Players": 0,
-                "Status": "ERROR",
-                "Error": str(e),
-            })
+    return str(age) if 0 <= age < 120 else ""
 
-    print(f"FINAL {team['Team_Code']} PLAYERS: {len(best_rows)}")
 
-    return best_rows, diagnostics
+def build_scrape_row(player, team, extracted_at):
+    """
+    Maps one API player object onto the SCRAPE_COLUMNS contract the old
+    Playwright extractor produced, so downstream builders are unchanged.
+    """
+    first_name = clean_text(player.get("firstName"))
+    last_name = clean_text(player.get("lastName"))
+    suffix = clean_text(player.get("lastNameSuffix"))
 
+    full_last = f"{last_name} {suffix}".strip() if suffix else last_name
+    full_name = clean_text(f"{first_name} {full_last}")
+
+    profile_url = clean_text(player.get("profileUrl"))
+
+    jersey = player.get("jerseyNum")
+    jersey = "" if jersey is None else str(jersey)
+
+    return {
+        "Player": full_name,
+        "First_Name": first_name,
+        "Last_Name": full_last,
+        "Team": team["Team"],
+        "Team_Code": team["Team_Code"],
+        "Division": team["Division"],
+        "Position": normalize_position(player.get("position")),
+        "Position_Group": "",
+        "Jersey": jersey,
+        "Handedness": clean_text(player.get("handedness")),
+        "Height": clean_text(player.get("height")),
+        "Age": age_from_dob(player.get("dob")),
+        "College": clean_text(player.get("college")),
+        "Country": clean_text(player.get("country")),
+        "Image_Slug": slug_from_profile_url(profile_url),
+        "Image_URL": profile_url,
+        "Page_URL": team["URLs"][0],
+        "Page_Title": f"{team['Team']} Roster",
+        "Extracted_At": extracted_at,
+    }
 
 def sort_master_roster(df):
     if df.empty:
@@ -703,33 +710,60 @@ def sort_master_roster(df):
     return out
 
 
-async def scrape_all_pll_rosters_async():
+def fetch_all_pll_rosters():
+    """
+    Builds the roster DataFrame from the PLL stats API.
+
+    Returns the same (roster_df, diagnostics_df) contract the old Playwright
+    scraper returned, with roster_df in SCRAPE_COLUMNS shape, so every
+    downstream sheet builder keeps working unchanged.
+    """
     all_rows = []
     all_diagnostics = []
 
-    async with async_playwright() as p:
-        browser = await launch_browser(p)
+    api_players, _ = fetch_pll_players()
+    api_teams, _ = fetch_pll_standings()
 
-        context = await browser.new_context(
-            viewport={"width": 1600, "height": 2400},
-            user_agent=(
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-            ),
-        )
+    known_api_ids = {clean_text(t.get("teamId")).upper() for t in api_teams}
 
-        page = await context.new_page()
+    players_by_api_id = {}
+    for player in api_players:
+        api_id = clean_text(player.get("teamId")).upper()
+        players_by_api_id.setdefault(api_id, []).append(player)
 
-        try:
-            for team in PLL_TEAMS:
-                rows, diagnostics = await scrape_team_roster(page, team)
-                all_rows.extend(rows)
-                all_diagnostics.extend(diagnostics)
-                await page.wait_for_timeout(1000)
+    # Surface any team id the API returned that we do not map to a sheet tab.
+    unmapped = set(players_by_api_id) - {t["API_ID"] for t in PLL_TEAMS}
+    if unmapped:
+        print(f"WARNING: API returned unmapped team ids: {sorted(unmapped)}")
 
-        finally:
-            await context.close()
-            await browser.close()
+    missing_from_standings = {t["API_ID"] for t in PLL_TEAMS} - known_api_ids
+    if missing_from_standings:
+        print(f"WARNING: teams missing from standings: {sorted(missing_from_standings)}")
+
+    extracted_at = now_iso()
+
+    for team in PLL_TEAMS:
+        api_id = team["API_ID"]
+        roster = players_by_api_id.get(api_id, [])
+
+        rows = [build_scrape_row(player, team, extracted_at) for player in roster]
+        rows = [r for r in rows if r["Player"] and r["Position"] != "UNK"]
+
+        print(f"{team['Team_Code']} ({api_id}) — {len(rows)} players")
+
+        all_rows.extend(rows)
+
+        all_diagnostics.append({
+            "Team_Code": team["Team_Code"],
+            "Team": team["Team"],
+            "URL_Tried": players_url(),
+            "Final_URL": players_url(),
+            "Raw_Card_Containers": len(roster),
+            "Raw_Valid_Rows": len(rows),
+            "Deduped_Players": len(rows),
+            "Status": "OK" if rows else "NO_PLAYERS",
+            "Error": "" if rows else f"No players returned for API team id {api_id}",
+        })
 
     roster_df = pd.DataFrame(all_rows)
 
@@ -740,26 +774,7 @@ async def scrape_all_pll_rosters_async():
             if col not in roster_df.columns:
                 roster_df[col] = ""
 
-        roster_df = roster_df[[
-            "Player",
-            "First_Name",
-            "Last_Name",
-            "Team",
-            "Team_Code",
-            "Division",
-            "Position",
-            "Jersey",
-            "Handedness",
-            "Height",
-            "Age",
-            "College",
-            "Country",
-            "Image_Slug",
-            "Image_URL",
-            "Page_URL",
-            "Page_Title",
-            "Extracted_At",
-        ]].copy()
+        roster_df = roster_df[SCRAPE_COLUMNS].copy()
 
         for col in roster_df.columns:
             roster_df[col] = roster_df[col].map(clean_text)
@@ -832,14 +847,17 @@ def read_existing_master_manual_fields(master_ws):
         if not player:
             continue
 
-        key = player_key_from_row(row)
-
-        manual_map[key] = {
+        entry = {
             "Tier": clean_text(row.get("Tier")),
             "Lineup Status": clean_text(row.get("Lineup Status")) or "Active",
             "Injury Status": clean_text(row.get("Injury Status")) or "Healthy",
             "Manual Notes": clean_text(row.get("Manual Notes")),
         }
+
+        # Index under both slug and name so a changed slug format cannot
+        # orphan manual values. First writer wins per key.
+        for key in player_keys_from_row(row):
+            manual_map.setdefault(key, entry)
 
     return manual_map
 
@@ -848,10 +866,15 @@ def preserve_master_manual_fields(new_df, manual_map):
     out = new_df.copy()
 
     for idx, row in out.iterrows():
-        key = player_key_from_row(row.to_dict())
+        preserved = None
 
-        if key in manual_map:
-            for col, value in manual_map[key].items():
+        for key in player_keys_from_row(row.to_dict()):
+            if key in manual_map:
+                preserved = manual_map[key]
+                break
+
+        if preserved is not None:
+            for col, value in preserved.items():
                 out.at[idx, col] = value
         else:
             out.at[idx, "Lineup Status"] = out.at[idx, "Lineup Status"] or "Active"
@@ -1648,12 +1671,13 @@ def validate_scrape(roster_df):
     return issues
 
 
-async def main():
+def main():
     print("=" * 100)
     print("PLL ROSTER UPDATE STARTED")
     print("=" * 100)
+    print(f"Season: {PLL_SEASON} {PLL_SEASON_SEGMENT}")
 
-    roster_df, diagnostics_df = await scrape_all_pll_rosters_async()
+    roster_df, diagnostics_df = fetch_all_pll_rosters()
 
     print("\nScrape summary:")
     print("Total players:", len(roster_df))
@@ -1684,4 +1708,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

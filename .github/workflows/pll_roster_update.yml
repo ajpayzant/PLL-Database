@@ -25,6 +25,13 @@ jobs:
     env:
       PLL_SPREADSHEET_ID: ${{ github.event.inputs.spreadsheet_id || secrets.PLL_SPREADSHEET_ID }}
       GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+      PLL_BEARER_TOKEN: ${{ secrets.PLL_BEARER_TOKEN }}
+      PLL_SEASON: "2026"
+      PLL_SEASON_SEGMENT: regular
+      # The script already reads these two; the dispatch inputs were never
+      # wired to them, so the Dashboard always logged "unknown".
+      TRIGGERED_BY: ${{ github.event.inputs.triggered_by || 'schedule' }}
+      TRIGGER_SOURCE: ${{ github.event.inputs.trigger_source || 'github-actions' }}
 
     steps:
       - name: Checkout repository
@@ -37,8 +44,7 @@ jobs:
 
       - name: Install Python dependencies
         run: |
-          pip install -U pandas numpy gspread google-auth playwright openpyxl
-          python -m playwright install --with-deps chromium
+          pip install -r requirements.txt
 
       - name: Update PLL rosters
         run: |
